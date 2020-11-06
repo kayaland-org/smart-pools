@@ -1487,7 +1487,7 @@ contract BalLiquiditySmartPool is BasicSmartPool{
   ) external onlyTokenBinder denyReentry {
     IERC20 token = IERC20(tokenAddress);
     require(
-      token.transferFrom(msg.sender, address(_bPool), balance),
+      token.transferFrom(msg.sender, address(this), balance),
       "BalLiquiditySmartPool.bind: transferFrom failed"
     );
     token.approve(address(_bPool), uint256(-1));
@@ -1505,7 +1505,7 @@ contract BalLiquiditySmartPool is BasicSmartPool{
     uint256 oldBalance = token.balanceOf(address(_bPool));
     if (balance > oldBalance) {
       require(
-        token.transferFrom(msg.sender, address(_bPool), balance.sub(oldBalance)),
+        token.transferFrom(msg.sender, address(this), balance.sub(oldBalance)),
         "BalLiquiditySmartPool.rebind: transferFrom failed"
       );
       token.approve(address(_bPool), uint256(-1));
