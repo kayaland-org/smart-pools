@@ -1,0 +1,242 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.6.12;
+import "@openzeppelin/contracts/utils/EnumerableSet.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
+import "@openzeppelin/contracts/math/SafeMath.sol";
+
+import "../interfaces/curve/ICurveFi.sol";
+import "../interfaces/curve/Gauge.sol";
+import "../interfaces/curve/IMint.sol";
+import "../interfaces/curve/VoteEscrow.sol";
+import "../interfaces/curve/FeeDistribution.sol";
+import "../interfaces/kaya/ISmartPool.sol";
+import "../interfaces/kaya/IController.sol";
+import "../libraries/UniswapV2ExpandLibrary.sol";
+import "../libraries/ExpandMath.sol";
+import "../GovIdentity.sol";
+
+contract CurveLiquidityStrategy is ERC20, GovIdentity {
+
+    using SafeERC20 for IERC20;
+    using Address for address;
+    using ExpandMath for uint256;
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    address constant public crv=address(0xD533a949740bb3306d119CC777fa900bA034cd52);
+    address constant public minter=address(0xd061D61a4d941c39E5453435B6345Dc261C2fcE0);
+    address constant public escrow=address(0x5f3b5DfEb7B28CDbD7FAba78963EE202a494e2A2);
+    address constant public feeDistribution=address(0xA464e6DCda8AC41e03616F95f4BC98a13b8922Dc);
+    address constant public feeToken = address(0x6c3F90f043a72FA612cbac8115EE7e52BDe6E490);
+    address constant public weth = address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+
+    IController public controller;
+
+    EnumerableSet.AddressSet private _pools;
+
+    struct Curve{
+        address pool;
+        address token;
+        address gauge;
+    }
+
+    constructor(
+        address _controller)
+    public
+    ERC20('Share Token', 'ST'){
+        controller = IController(_controller);
+    }
+
+    modifier onlyAuthorize() {
+        require(msg.sender == getGovernance()
+        ||msg.sender==getStrategist()
+            ||msg.sender==address(controller)||
+        msg.sender==address(this), "Strategy.onlyAuthorize: !authorize");
+        _;
+    }
+
+    function getTokens()public view returns(address[1] memory ts){
+        (,address _vaultToken) = vaultInfo();
+        ts[0]=_vaultToken;
+    }
+
+    function getWeights()public view returns(uint256[1] memory ws){
+        ws[0]=100e18;
+    }
+
+//    function _pullToken(address _token)internal returns(uint256 amount){
+//        IERC20 token = IERC20(_token);
+//        amount = token.balanceOf(msg.sender);
+//        if(amount>0){
+//            token.safeTransferFrom(msg.sender, address(this), amount);
+//        }
+//    }
+
+    function _vaultInfo() internal view returns (address, address){
+        address _vault = controller.vaults(address(this));
+        address _token = ISmartPool(_vault).token();
+        return (_vault, _token);
+    }
+
+    function init() external {
+
+    }
+
+    function approveTokens() public {
+
+    }
+
+    function _updatePools(address _pool)internal{
+        bool isNeedPool=IERC20(_pool).balanceOf(address(this))>0?true:false;
+        if(!_pools.contains(_pool)&&isNeedPool){
+            _pools.add(_pool);
+        }else if(_pools.contains(_pool)&&!isNeedPool){
+            _pools.remove(_pool);
+        }
+    }
+
+    //提供流动性(池子,代币,数量)
+    function addLiquidity(address _pool,uint256[2] memory amounts)public onlyAuthorize{
+        //todo coins approve to _pool
+        ICurveFi(_pool).add_liquidity(amounts,0);
+        _updatePools(_pool);
+    }
+
+    //提供流动性(池子,代币,数量)
+    function addLiquidity(address _pool,uint256[3] memory amounts)public onlyAuthorize{
+        //todo coins approve to _pool
+        ICurveFi(_pool).add_liquidity(amounts,0);
+        _updatePools(_pool);
+    }
+
+    //提供流动性(池子,代币,数量)
+    function addLiquidity(address _pool,uint256[4] memory amounts)public onlyAuthorize{
+        //todo coins approve to _pool
+        ICurveFi(_pool).add_liquidity(amounts,0);
+        updatePools(_pool);
+    }
+
+    //撤回流动性(池子,代币,数量)
+    function removeLiquidity(address _pool,uint256 _liquidity)public onlyAuthorize{
+        require(IERC20(_pool).balanceOf(address(this))>=_liquidity,'Strategy.removeLiquidity: Insufficient liquidity limit');
+        ICurveFi(_pool).remove_liquidity(_liquidity,[uint256(0),0,0,0]);
+        updatePools(_pool);
+    }
+
+    //质押流动性LP数量
+    function pledge(address _pool,address _gauge,uint256 _amount)public onlyAuthorize{
+        require(IERC20(_pool).balanceOf(address(this))>=_amount,'Strategy.pledge: Insufficient liquidity limit');
+        //todo lp approve to _gauge
+        Gauge(_gauge).deposit(_amount);
+    }
+
+    //取消质押流动性LP
+    function unpledge(address _gauge,uint256 _amount)public onlyAuthorize{
+        Gauge gauge=Gauge(_gauge);
+        require(gauge.balanceOf(address(this))>=_amount,'Strategy.unpledge: Insufficient liquidity limit');
+        gauge.withdraw(_amount);
+    }
+
+    //收割CRV
+    function clarmCRV(address _gauge)public onlyAuthorize{
+        IMint(minter).mint(_gauge);
+    }
+
+    //开启CRV锁仓
+    function lockCRV(uint256 _amount, uint256 _unlockTime) public onlyAuthorize{
+        IERC20(crv).safeApprove(escrow, 0);
+        IERC20(crv).safeApprove(escrow, _amount);
+        VoteEscrow(escrow).create_lock(_amount, _unlockTime);
+    }
+
+    function deposit(uint256 _amount) external onlyAuthorize{
+        (address _vault,address _vaultToken) = _vaultInfo();
+        require(_amount > 0, 'Strategy.deposit: token balance is zero');
+        IERC20 tokenContract = IERC20(_vaultToken);
+        require(tokenContract.balanceOf(msg.sender) >= _amount, 'Strategy.deposit: Insufficient balance');
+        tokenContract.safeTransferFrom(msg.sender, address(this), _amount);
+    }
+
+    //变卖指定令牌为USDT，发送给Vault
+    function withdraw(address _token,uint256 _amount) public onlyAuthorize{
+        (address _valut,address _vaultToken) = _vaultInfo();
+        uint256 amountOut=swapIn(_token, weth,_amount);
+        amountOut=swapIn(weth, _vaultToken,amountOut);
+        IERC20(_vaultToken).transfer(_valut,amountOut);
+    }
+
+    function withdraw(uint256 _amount) external onlyAuthorize{
+        require(_amount > 0, 'Strategy.withdraw: Must be greater than 0 amount');
+        require(_amount <= available(), 'Strategy.withdraw: Must be less than assets');
+        (address _vault,address _vaultToken) = _vaultInfo();
+        IERC20 vaultToken=IERC20(_vaultToken);
+        uint256 cashBal=vaultToken.balanceOf(address(this));
+        if (cashBal < _amount) {
+            uint256 diff = _amount.sub(cashBal);
+            //用哪一个池子呢
+            uint256 lp = diff.mul(1e18).div(ICurveFi(crv).get_virtual_price());
+            //LP不够退质押
+            //退LP
+        }
+        vaultToken.transfer(_vault,_amount);
+    }
+
+    function withdraw(address _token) external onlyAuthorize returns (uint256 balance){
+        IERC20 token=IERC20(_token);
+        balance = token.balanceOf(address(this));
+        if (balance > 0) {
+            token.safeTransfer(address(controller), balance);
+        }
+    }
+
+    function withdrawAll() external onlyAuthorize{
+        (address _vault,address _vaultToken) = vaultInfo();
+        IERC20 vaultToken=IERC20(_vaultToken);
+        vaultToken.transfer(_vault,vaultToken.balanceOf(address(this)));
+    }
+
+    function swapIn(address _fromToken, address _toToken,uint256 amountIn) public onlyAuthorize returns(uint256 amountOut){
+        amountOut=amountIn;
+        if (amountIn > 0 && _fromToken != _toToken) {
+            amountOut = UniswapV2ExpandLibrary.getAmountOut(_fromToken, _toToken, amountIn);
+            UniswapV2ExpandLibrary.swap(address(this),_fromToken, _toToken, amountIn, amountOut);
+        }
+    }
+
+    function swapOut(address _fromToken, address _toToken,uint256 amountOut) public onlyAuthorize returns(uint256 amountIn){
+        amountIn=amountOut;
+        if (amountOut > 0 && _fromToken != _toToken) {
+            amountIn = UniswapV2ExpandLibrary.getAmountIn(_fromToken, _toToken, amountOut);
+            UniswapV2ExpandLibrary.swap(address(this),_fromToken, _toToken, amountIn, amountOut);
+        }
+    }
+
+    //收割项目方收益
+    //veCRV加速
+    //veCRV管理费
+    //管理费收割
+//    function claim() public {
+//        FeeDistribution(feeDistribution).claim(address(this));
+//    }
+    //查看拥有底层资产的池子
+    //查看池子的底层资产量
+    //累计所有池子的资产数量,底层资产不包括CRV和veCRV，项目方代币
+
+
+    function assets() public view returns (uint256){
+        uint256 length=_pools.length();
+        uint256 total=0;
+        for(uint256 i=0;i<length;i++){
+            address pool=_pools.at(i);
+            address gauge;
+//            uint256 lp=ICurveFi(pool);
+            total=total.add(ICurveFi(pool).get_virtual_price());
+        }
+        return total;
+    }
+
+    function available() public view returns (uint256){
+        return assets();
+    }
+
+}
